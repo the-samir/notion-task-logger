@@ -1,5 +1,3 @@
-const DB_ID = '1df0b457c8b48086b007e96a116faf27';
-
 const FIELD_EMOJI = {
   'Status':      '🔄',
   'Priority':    '🎯',
@@ -12,6 +10,11 @@ const FIELD_EMOJI = {
   'Parent-task': '🔗',
   'Sub-tasks':   '📌',
 };
+
+const SKIP_FIELDS = [
+  'Task name', 'Updated at', 'Done subtask bar',
+  'In progress subtask bar', 'To do subtask bar', 'Past due'
+];
 
 async function notionFetch(path, method = 'GET', body = null, token) {
   const res = await fetch(`https://api.notion.com/v1${path}`, {
@@ -29,20 +32,20 @@ async function notionFetch(path, method = 'GET', body = null, token) {
 function extractValue(prop) {
   if (!prop) return null;
   switch (prop.type) {
-    case 'status':      return prop.status?.name;
-    case 'select':      return prop.select?.name;
-    case 'multi_select':return prop.multi_select?.map(t => t.name).join(', ') || null;
-    case 'people':      return prop.people?.map(u => u.name).join(', ') || null;
-    case 'date':        return prop.date?.start;
-    case 'rich_text':   return prop.rich_text?.[0]?.plain_text;
-    case 'title':       return prop.title?.[0]?.plain_text;
-    case 'number':      return prop.number?.toString();
-    case 'checkbox':    return prop.checkbox ? 'Bəli' : 'Xeyr';
-    case 'url':         return prop.url;
-    case 'email':       return prop.email;
-    case 'phone_number':return prop.phone_number;
-    case 'relation':    return prop.relation?.length ? `${prop.relation.length} əlaqə` : null;
-    default:            return null;
+    case 'status':       return prop.status?.name;
+    case 'select':       return prop.select?.name;
+    case 'multi_select': return prop.multi_select?.map(t => t.name).join(', ') || null;
+    case 'people':       return prop.people?.map(u => u.name).join(', ') || null;
+    case 'date':         return prop.date?.start;
+    case 'rich_text':    return prop.rich_text?.[0]?.plain_text;
+    case 'title':        return prop.title?.[0]?.plain_text;
+    case 'number':       return prop.number?.toString();
+    case 'checkbox':     return prop.checkbox ? 'Bəli' : 'Xeyr';
+    case 'url':          return prop.url;
+    case 'email':        return prop.email;
+    case 'phone_number': return prop.phone_number;
+    case 'relation':     return prop.relation?.length ? `${prop.relation.length} əlaqə` : null;
+    default:             return null;
   }
 }
 
@@ -56,22 +59,6 @@ function formatBakuTime() {
     minute: '2-digit',
     second: '2-digit'
   });
-}
-
-async function appendLog(pageId, logLine, token) {
-  await notionFetch(`/blocks/${pageId}/children`, 'PATCH', {
-    children: [{
-      object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [{
-          type: 'text',
-          text: { content: logLine },
-          annotations: { color: 'gray' }
-        }]
-      }
-    }]
-  }, token);
 }
 
 export default async function handler(req, res) {
@@ -88,33 +75,80 @@ export default async function handler(req, res) {
   try {
     const payload = req.body;
 
-    // Notion webhook payload-dan page ID-ni al
     const pageId = payload?.data?.id || payload?.entity?.id;
     if (!pageId) {
       return res.status(400).json({ error: 'Page ID tapılmadı' });
     }
 
-    // Dəyişən propertyləri al
     const changedProps = payload?.data?.properties || {};
     const now = formatBakuTime();
+
+    // Webhook-dan dəyişən field-ləri al
+    const changedFieldNames = Object.keys(changedProps).filter(f => !SKIP_FIELDS.includes(f));
+    if (changedFieldNames.length === 0) {
+      return res.status(200).json({ success: true, logsWritten: 0, logs: [] });
+    }
+
+    // Notion API-dən taskın cari dəyərlərini oxu (köhnə dəyər üçün)
+    const currentPage = await notionFetch(`/pages/${pageId}`, 'GET', null, token);
+    const currentProps = currentPage?.properties || {};
+
     const logLines = [];
 
-    for (const [fieldName, propData] of Object.entries(changedProps)) {
-      // System fieldlərini keç
-      if (['Task name', 'Updated at', 'Done subtask bar', 'In progress subtask bar', 'To do subtask bar', 'Past due'].includes(fieldName)) continue;
+    for (const fieldName of changedFieldNames) {
+      const newValue = extractValue(changedProps[fieldName]);
+      if (newValue === null || newValue === undefined || newValue === '') continue;
 
-      const newValue = extractValue(propData);
-      if (newValue === null || newValue === undefined) continue;
-
+      const oldValue = extractValue(currentProps[fieldName]);
       const emoji = FIELD_EMOJI[fieldName] || '✏️';
-      const logLine = `${emoji} ${fieldName}: ${newValue} | ${now}`;
-      logLines.push(logLine);
+
+      // Əvvəlki dəyər varsa və fərqlidirsə göstər
+      if (oldValue && oldValue !== newValue) {
+        logLines.push(`${emoji} ${fieldName}: ${oldValue} → ${newValue}`);
+      } else {
+        logLines.push(`${emoji} ${fieldName}: ${newValue}`);
+      }
     }
 
-    // Logları taska yaz
-    for (const line of logLines) {
-      await appendLog(pageId, line, token);
+    if (logLines.length === 0) {
+      return res.status(200).json({ success: true, logsWritten: 0, logs: [] });
     }
+
+    // Başlıq — bold, tarix+saat
+    const headerBlock = {
+      object: 'block',
+      type: 'paragraph',
+      paragraph: {
+        rich_text: [{
+          type: 'text',
+          text: { content: `📋 ${now}` },
+          annotations: { bold: true }
+        }]
+      }
+    };
+
+    // Log sətirləri — gri
+    const logBlocks = logLines.map(line => ({
+      object: 'block',
+      type: 'paragraph',
+      paragraph: {
+        rich_text: [{
+          type: 'text',
+          text: { content: line },
+          annotations: { color: 'gray' }
+        }]
+      }
+    }));
+
+    // Divider
+    const dividerBlock = {
+      object: 'block',
+      type: 'divider',
+      divider: {}
+    };
+
+    const blocks = [headerBlock, ...logBlocks, dividerBlock];
+    await notionFetch(`/blocks/${pageId}/children`, 'PATCH', { children: blocks }, token);
 
     return res.status(200).json({
       success: true,
