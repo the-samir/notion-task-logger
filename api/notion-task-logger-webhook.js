@@ -11,11 +11,6 @@ const FIELD_EMOJI = {
   'Sub-tasks':   '📌',
 };
 
-const SKIP_FIELDS = [
-  'Task name', 'Updated at', 'Done subtask bar',
-  'In progress subtask bar', 'To do subtask bar', 'Past due'
-];
-
 async function notionFetch(path, method = 'GET', body = null, token) {
   const res = await fetch(`https://api.notion.com/v1${path}`, {
     method,
@@ -27,6 +22,27 @@ async function notionFetch(path, method = 'GET', body = null, token) {
     ...(body ? { body: JSON.stringify(body) } : {})
   });
   return res.json();
+}
+
+async function redisGet(key) {
+  const url = `${process.env.KV_REST_API_URL}/get/${encodeURIComponent(key)}`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${process.env.KV_REST_API_TOKEN}` }
+  });
+  const data = await res.json();
+  return data.result ? JSON.parse(data.result) : null;
+}
+
+async function redisSet(key, value) {
+  const url = `${process.env.KV_REST_API_URL}/set/${encodeURIComponent(key)}`;
+  await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.KV_REST_API_TOKEN}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(JSON.stringify(value))
+  });
 }
 
 function extractValue(prop) {
@@ -74,80 +90,79 @@ export default async function handler(req, res) {
 
   try {
     const payload = req.body;
-
     const pageId = payload?.data?.id || payload?.entity?.id;
-    if (!pageId) {
-      return res.status(400).json({ error: 'Page ID tapılmadı' });
+    if (!pageId) return res.status(400).json({ error: 'Page ID tapılmadı' });
+
+    // Webhook-dan gələn bütün field-lər (taskın cari vəziyyəti)
+    const incomingProps = payload?.data?.properties || {};
+
+    // Cari vəziyyəti çıxart — yalnız izlədiyimiz field-lər
+    const currentState = {};
+    for (const [fieldName, propData] of Object.entries(incomingProps)) {
+
+      const val = extractValue(propData);
+      if (val) currentState[fieldName] = val;
     }
 
-    const changedProps = payload?.data?.properties || {};
-    const now = formatBakuTime();
+    // Redis-dən əvvəlki vəziyyəti oxu
+    const redisKey = `task:${pageId}`;
+    const previousState = await redisGet(redisKey) || {};
 
-    // Webhook-dan dəyişən field-ləri al
-    const changedFieldNames = Object.keys(changedProps).filter(f => !SKIP_FIELDS.includes(f));
-    if (changedFieldNames.length === 0) {
-      return res.status(200).json({ success: true, logsWritten: 0, logs: [] });
-    }
-
-    // Notion API-dən taskın cari dəyərlərini oxu (köhnə dəyər üçün)
-    const currentPage = await notionFetch(`/pages/${pageId}`, 'GET', null, token);
-    const currentProps = currentPage?.properties || {};
-
+    // Fərqli olanları tap
     const logLines = [];
-
-    for (const fieldName of changedFieldNames) {
-      const newValue = extractValue(changedProps[fieldName]);
-      if (newValue === null || newValue === undefined || newValue === '') continue;
-
-      const oldValue = extractValue(currentProps[fieldName]);
+    for (const [fieldName, currentVal] of Object.entries(currentState)) {
+      const prevVal = previousState[fieldName];
+      if (prevVal === undefined) continue; // ilk dəfədir, log yoxdur
+      if (prevVal === currentVal) continue; // dəyişməyib
       const emoji = FIELD_EMOJI[fieldName] || '✏️';
-
-      // Əvvəlki dəyər varsa və fərqlidirsə göstər
-      if (oldValue && oldValue !== newValue) {
-        logLines.push(`${emoji} ${fieldName}: ${oldValue} → ${newValue}`);
-      } else {
-        logLines.push(`${emoji} ${fieldName}: ${newValue}`);
-      }
+      logLines.push(`${emoji} ${fieldName}: ${prevVal} → ${currentVal}`);
     }
+
+    // Cari vəziyyəti Redis-ə yaz (növbəti dəfə üçün)
+    await redisSet(redisKey, currentState);
 
     if (logLines.length === 0) {
       return res.status(200).json({ success: true, logsWritten: 0, logs: [] });
     }
 
-    // Başlıq — bold, tarix+saat
-    const headerBlock = {
-      object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [{
-          type: 'text',
-          text: { content: `📋 ${now}` },
-          annotations: { bold: true }
-        }]
+    const now = formatBakuTime();
+
+    // Başlıq + loglar + divider
+    const blocks = [
+      {
+        object: 'block',
+        type: 'divider',
+        divider: {}
+      },
+      {
+        object: 'block',
+        type: 'paragraph',
+        paragraph: {
+          rich_text: [{
+            type: 'text',
+            text: { content: `📋 ${now}` },
+            annotations: { bold: true }
+          }]
+        }
+      },
+      ...logLines.map(line => ({
+        object: 'block',
+        type: 'paragraph',
+        paragraph: {
+          rich_text: [{
+            type: 'text',
+            text: { content: line },
+            annotations: { color: 'gray' }
+          }]
+        }
+      })),
+      {
+        object: 'block',
+        type: 'divider',
+        divider: {}
       }
-    };
+    ];
 
-    // Log sətirləri — gri
-    const logBlocks = logLines.map(line => ({
-      object: 'block',
-      type: 'paragraph',
-      paragraph: {
-        rich_text: [{
-          type: 'text',
-          text: { content: line },
-          annotations: { color: 'gray' }
-        }]
-      }
-    }));
-
-    // Divider
-    const dividerBlock = {
-      object: 'block',
-      type: 'divider',
-      divider: {}
-    };
-
-    const blocks = [headerBlock, ...logBlocks, dividerBlock];
     await notionFetch(`/blocks/${pageId}/children`, 'PATCH', { children: blocks }, token);
 
     return res.status(200).json({
